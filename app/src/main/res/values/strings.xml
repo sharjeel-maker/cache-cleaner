@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">1 Tap Cleaner</string>
+    <string name="accessibility_service_description">Used to automatically clear app caches.</string>
+</resources>
