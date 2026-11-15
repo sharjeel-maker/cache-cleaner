@@ -11,6 +11,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import java.util.ArrayDeque
 
 class CacheCleanerService : AccessibilityService() {
 
@@ -76,13 +77,13 @@ class CacheCleanerService : AccessibilityService() {
 
         when (state) {
             State.WAITING_FOR_APP_INFO -> {
-                val storageNode = findNodeByText(rootNode, "storage")
+                val storageNode = findNodeByTextRobust(rootNode, "storage")
                 if (storageNode != null && clickNode(storageNode)) {
                     state = State.WAITING_FOR_STORAGE
                 }
             }
             State.WAITING_FOR_STORAGE -> {
-                val clearCacheNode = findNodeByText(rootNode, "clear cache")
+                val clearCacheNode = findNodeByTextRobust(rootNode, "clear cache")
                 if (clearCacheNode != null) {
                     if (clearCacheNode.isEnabled) {
                         if (clickNode(clearCacheNode)) {
@@ -117,12 +118,26 @@ class CacheCleanerService : AccessibilityService() {
         return false
     }
 
-    private fun findNodeByText(node: AccessibilityNodeInfo, text: String): AccessibilityNodeInfo? {
-        val list = node.findAccessibilityNodeInfosByText(text)
-        for (n in list) {
-            val nodeText = n.text?.toString()?.lowercase() ?: n.contentDescription?.toString()?.lowercase() ?: ""
-            if (nodeText.contains(text.lowercase())) {
-                return n
+    // Bulletproof search that manually scans every element on the screen
+    private fun findNodeByTextRobust(root: AccessibilityNodeInfo, text: String): AccessibilityNodeInfo? {
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        
+        val searchLower = text.lowercase()
+
+        while (queue.isNotEmpty()) {
+            val current = queue.poll()
+            if (current == null) continue
+
+            val nodeText = current.text?.toString()?.lowercase() ?: ""
+            val contentDesc = current.contentDescription?.toString()?.lowercase() ?: ""
+
+            if (nodeText.contains(searchLower) || contentDesc.contains(searchLower)) {
+                return current
+            }
+
+            for (i in 0 until current.childCount) {
+                current.getChild(i)?.let { queue.add(it) }
             }
         }
         return null
@@ -131,7 +146,6 @@ class CacheCleanerService : AccessibilityService() {
     private fun openAppInfo(packageName: String) {
         val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
             data = Uri.parse("package:$packageName")
-            // This guarantees we instantly teleport to the new App Info screen without piling up history
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_CLEAR_TASK)
         }
         startActivity(intent)
