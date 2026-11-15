@@ -7,10 +7,15 @@ import android.provider.Settings
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 class CacheCleanerService : AccessibilityService() {
 
     companion object {
+        var instance: CacheCleanerService? = null
         var isCleaning = false
         var packageQueue = mutableListOf<String>()
         var currentPackage: String? = null
@@ -19,76 +24,104 @@ class CacheCleanerService : AccessibilityService() {
             packageQueue.clear()
             packageQueue.addAll(packages)
             isCleaning = true
+            instance?.processNextApp()
         }
 
         fun stopCleaning() {
             isCleaning = false
             packageQueue.clear()
             currentPackage = null
+            instance?.performGlobalAction(GLOBAL_ACTION_HOME)
         }
     }
 
     private var state = State.IDLE
+    private val serviceScope = CoroutineScope(Dispatchers.Main)
+    private var isActionPending = false
 
     enum class State {
-        IDLE, WAITING_FOR_APP_INFO, WAITING_FOR_STORAGE, WAITING_FOR_CLEAR_CACHE_CONFIRMATION
+        IDLE, WAITING_FOR_APP_INFO, WAITING_FOR_STORAGE
+    }
+
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        instance = this
+    }
+
+    override fun onUnbind(intent: Intent?): Boolean {
+        instance = null
+        return super.onUnbind(intent)
+    }
+
+    fun processNextApp() {
+        if (!isCleaning) return
+        
+        if (packageQueue.isNotEmpty()) {
+            currentPackage = packageQueue.removeAt(0)
+            state = State.WAITING_FOR_APP_INFO
+            isActionPending = false
+            openAppInfo(currentPackage!!)
+        } else {
+            isCleaning = false
+            state = State.IDLE
+            Log.d("CacheCleaner", "Cleaning finished!")
+            performGlobalAction(GLOBAL_ACTION_HOME)
+        }
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (!isCleaning) return
+        if (!isCleaning || isActionPending) return
 
         val rootNode = rootInActiveWindow ?: return
 
         when (state) {
-            State.IDLE -> {
-                if (packageQueue.isNotEmpty()) {
-                    currentPackage = packageQueue.removeAt(0)
-                    openAppInfo(currentPackage!!)
-                    state = State.WAITING_FOR_APP_INFO
-                } else {
-                    isCleaning = false
-                    Log.d("CacheCleaner", "Cleaning finished!")
-                }
-            }
             State.WAITING_FOR_APP_INFO -> {
-                // Find "Storage & cache" or "Storage"
-                val storageNode = findNodeByText(rootNode, "Storage & cache") ?: findNodeByText(rootNode, "Storage")
-                if (storageNode != null) {
-                    if (storageNode.parent?.isClickable == true) {
-                        storageNode.parent?.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                    } else if (storageNode.isClickable) {
-                        storageNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                    }
+                val storageNode = findNodeByText(rootNode, "storage")
+                if (storageNode != null && clickNode(storageNode)) {
                     state = State.WAITING_FOR_STORAGE
                 }
             }
             State.WAITING_FOR_STORAGE -> {
-                // Find "Clear cache"
-                val clearCacheNode = findNodeByText(rootNode, "Clear cache")
+                val clearCacheNode = findNodeByText(rootNode, "clear cache")
                 if (clearCacheNode != null) {
                     if (clearCacheNode.isEnabled) {
-                         if (clearCacheNode.parent?.isClickable == true) {
-                            clearCacheNode.parent?.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                         } else if (clearCacheNode.isClickable) {
-                            clearCacheNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                         }
+                        if (clickNode(clearCacheNode)) {
+                            isActionPending = true
+                            serviceScope.launch {
+                                delay(500) // Wait half a second for cache to clear
+                                processNextApp() // Teleport to the next app instantly
+                            }
+                        }
+                    } else {
+                        // Cache is already empty/disabled, so just skip to the next app instantly!
+                        isActionPending = true
+                        serviceScope.launch {
+                            processNextApp()
+                        }
                     }
-                    // Wait a bit, then go back
-                    Thread.sleep(500)
-                    performGlobalAction(GLOBAL_ACTION_BACK)
-                    Thread.sleep(200)
-                    performGlobalAction(GLOBAL_ACTION_BACK)
-                    state = State.IDLE
                 }
             }
             else -> {}
         }
     }
 
+    private fun clickNode(node: AccessibilityNodeInfo?): Boolean {
+        var current = node
+        while (current != null) {
+            if (current.isClickable) {
+                current.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                return true
+            }
+            current = current.parent
+        }
+        return false
+    }
+
     private fun findNodeByText(node: AccessibilityNodeInfo, text: String): AccessibilityNodeInfo? {
         val list = node.findAccessibilityNodeInfosByText(text)
         for (n in list) {
-            if (n.text?.toString()?.equals(text, ignoreCase = true) == true) {
+            val nodeText = n.text?.toString()?.lowercase() ?: n.contentDescription?.toString()?.lowercase() ?: ""
+            if (nodeText.contains(text.lowercase())) {
                 return n
             }
         }
@@ -98,12 +131,14 @@ class CacheCleanerService : AccessibilityService() {
     private fun openAppInfo(packageName: String) {
         val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
             data = Uri.parse("package:$packageName")
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            // This guarantees we instantly teleport to the new App Info screen without piling up history
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_CLEAR_TASK)
         }
         startActivity(intent)
     }
 
     override fun onInterrupt() {
         isCleaning = false
+        state = State.IDLE
     }
 }
